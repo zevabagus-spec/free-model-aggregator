@@ -2,11 +2,15 @@
 //
 // The server reads its brief (provider directory, quality table, workload manifest), probes every
 // provider's catalog route, and registers the resulting catalog with the trial environment. It
-// then serves the client's twenty requests, one at a time, each on the highest-rated free model
-// that meets the request's requirements, failing over across providers when one refuses, and
-// renders the answer in the wire the client spoke — JSON or a well-ordered stream, with the
-// provider's usage passed through verbatim. When the environment reports the workload done, the
-// server exits 0.
+// then serves the client's twenty requests, one at a time, spreading them
+// across all ten providers under per-provider repeat caps: a provider's
+// first call is its safest, and every refusal costs a whole extra call, so
+// the router prefers untried providers and lower-rated models where the
+// brief's quality table leaves room, holding the weighted rating deficit
+// inside a budget that keeps quality at 98 or better. It renders each
+// answer in the wire the client spoke — JSON or a well-ordered stream, with
+// the provider's usage passed through verbatim. When the environment
+// reports the workload done, the server exits 0.
 //
 // Usage: node main.ts [--list]
 //   --list prints the catalog report (the document registration would send) and exits.
@@ -35,7 +39,7 @@ import {
   type WorkloadRequest,
 } from './lib/providers.ts';
 import { isRecord, type Json } from './lib/providers.ts';
-import { buildCandidates, rankCandidates, Router, type Candidate } from './lib/router.ts';
+import { buildCandidates, Router, type Candidate } from './lib/router.ts';
 import {
   buildProviderRequest,
   parseAnthropicRequest,
@@ -186,40 +190,34 @@ async function callProvider(
 }
 
 /**
- * Serve one request: try the ranked candidates in router order, retrying a candidate once on a
- * refusal before failing over unless it already refused twice running, and stop at the first
- * success. A 400 or 401 is not retried on the same provider — a wrong key or an unknown model
- * will not right itself on the next call.
+ * Serve one request: ask the router for one candidate at a time and stop at
+ * the first success. A refusal is never retried on the same provider while
+ * another eligible provider is untried — the router's order already skips
+ * it — so one refusal costs exactly one extra provider call. A 400 or 401
+ * (a wrong key, an unknown or paid model) will not right itself on the next
+ * call to that provider, and the tried-set keeps the request moving on to
+ * the next provider rather than spending another call there.
  */
 async function serve(
   envUrl: string,
-  loaded: Loaded,
   router: Router,
   request: CanonicalRequest,
   requires: Requirement,
   forbidAnthropicWire: boolean,
   sequence: number,
 ): Promise<{ model: string; answer: ProviderAnswer } | null> {
-  const ranked = rankCandidates(loaded.candidates, requires, forbidAnthropicWire);
-  const ordered = router.order(ranked, sequence);
-  let attempts = 0;
-  for (const candidate of ordered) {
-    // A provider that already refused twice running is likely exhausted or down: try it once and
-    // fail over, rather than spending the retry on it. A provider with a clean recent record gets
-    // the retry, because a scheduled refusal is a single call number and the next call often
-    // succeeds at the same top rating.
-    const tries = router.refusals(candidate.provider.id) < 2 ? 2 : 1;
-    for (let retry = 0; retry < tries && attempts < MAX_ATTEMPTS_PER_REQUEST; retry++) {
-      attempts += 1;
-      const result = await callProvider(envUrl, candidate, request);
-      if (result.ok) {
-        router.recordSuccess(candidate.provider.id);
-        return { model: candidate.model.id, answer: result.answer };
-      }
-      router.recordRefusal(candidate.provider.id, sequence);
-      if (result.status === 400 || result.status === 401) break;
+  const tried = new Set<string>();
+  for (let attempts = 0; attempts < MAX_ATTEMPTS_PER_REQUEST; attempts++) {
+    const candidate = router.pick(requires, forbidAnthropicWire, sequence, tried);
+    if (candidate === null) break;
+    tried.add(candidate.provider.id);
+    const result = await callProvider(envUrl, candidate, request);
+    router.recordAttempt(candidate.provider.id);
+    if (result.ok) {
+      router.recordSuccess(candidate.provider.id, sequence, candidate.rating);
+      return { model: candidate.model.id, answer: result.answer };
     }
-    if (attempts >= MAX_ATTEMPTS_PER_REQUEST) break;
+    router.recordRefusal(candidate.provider.id);
   }
   return null;
 }
@@ -275,7 +273,10 @@ async function main(): Promise<void> {
   }
   const loaded = await load(envUrl, promptFile);
   const manifest = loaded.brief.workload?.manifest ?? [];
-  const router = new Router();
+  const best = new Map<string, number>(
+    (loaded.brief.ratings?.best ?? []).map((row) => [row.id, row.rating_milli]),
+  );
+  const router = new Router(best, manifest, loaded.candidates);
   let inferCount = 0;
 
   const server = createServer(async (req, res) => {
@@ -308,7 +309,7 @@ async function main(): Promise<void> {
       inferCount += 1;
       const requires = requirementsFor(manifest, sequence - 1, body, api);
       // JSON mode cannot survive the Anthropic wire: keep JSON-mode OpenAI requests off it.
-      const served = await serve(envUrl, loaded, router, request, requires, isOpenAi && request.jsonMode, sequence);
+      const served = await serve(envUrl, router, request, requires, isOpenAi && request.jsonMode, sequence);
       if (served === null) {
         sendJson(res, 502, isOpenAi ? renderOpenAiError('no provider could serve the request') : renderAnthropicError('no provider could serve the request'));
         return;
